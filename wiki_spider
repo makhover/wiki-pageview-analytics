@@ -1,0 +1,183 @@
+#!/usr/bin/env python2.7
+# -*- coding: UTF-8 -*-
+
+from datetime import datetime, timedelta
+import time
+from multiprocessing.dummy import Pool as ThreadPool
+import sys
+import os
+import gzip
+import csv
+import re
+import MySQLdb
+import requests
+import logging
+import argparse
+
+BASE_URL = 'https://dumps.wikimedia.org/other/pageviews'
+URL = BASE_URL + '/{year}/{year}-{month:02d}/pageviews-{year}{month:02d}{day:02d}-{hour:02d}0000.gz'
+HOME = os.path.expanduser("~")
+WORK_DIR = os.path.normpath(HOME + '/Work/Mail.Ru/Temp/')
+LOGGER_FILE = os.path.join(WORK_DIR, 'wiki_spider.log')
+CSV_DIR = WORK_DIR
+WIKI_PROJECTS = ['ru']
+MAXDOP = 2
+
+#DB settings
+DB_HOST = 'localhost'
+DB_NAME = 'wiki'
+DB_USER = 'root'
+DB_PWD = 'p@ssw0rd'
+
+
+#logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
+logging.basicConfig(filename=LOGGER_FILE, level=logging.DEBUG)
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s', level=logging.INFO, datefmt='%a, %d %b %Y %H:%M:%S')
+csv.register_dialect(
+    'mydialect',
+    delimiter = '\t',
+    quotechar = '"',
+    doublequote = True,
+    skipinitialspace = True,
+    lineterminator = '\r\n',
+    quoting = csv.QUOTE_MINIMAL)
+
+
+def valid_date(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        msg = "Not a valid date: '{0}'.".format(s)
+        raise argparse.ArgumentTypeError(msg)
+
+
+def get_archive_url(d):
+    return URL.format(year=d.year, month=d.month, day=d.day, hour=d.hour)
+
+
+def get_all_links(start_dtm, end_dtm):
+    dif_hours = (end_dtm - start_dtm).days + 1
+    return [get_archive_url(start_dtm + timedelta(hours=x)) for x in range(0, 24 * dif_hours)]
+
+
+def download_file(url, filepath, filename):
+    logging.info("Start loading archive '{0}'".format(url))
+    if not os.path.exists(filepath):
+        logging.info("Create folder '{0}'".format(filepath))
+        os.makedirs(filepath)
+    file_ = os.path.join(filepath, filename)
+    if os.path.exists(file_):
+        logging.info("Remove file '{0}'".format(file_))
+        os.remove(file_)
+
+    logging.info("Loading file ...")
+    r = requests.get(url)
+    with open(file_, "wb") as code:
+        code.write(r.content)
+    logging.info("Archive {0} successfully downloaded to {1}".format(filename, filepath))
+
+
+def load_csv_to_db(csv_file):
+    logging.info("Start loading csv to db '{0}'".format(csv_file))
+
+    mydb = MySQLdb.connect(host=DB_HOST, db=DB_NAME, user=DB_USER, passwd=DB_PWD)
+    mycursor = mydb.cursor()
+
+    #TODO: Check if table doesn't exist
+    #TODO: Check if data already loaded
+    query = "LOAD DATA INFILE '" + csv_file + "' INTO TABLE pageview FIELDS TERMINATED BY '\t' ENCLOSED BY '""' LINES TERMINATED BY '\r\n' " \
+                                              " IGNORE 1 LINES (dtm, project, page, counter);"
+    mycursor.execute(query)
+    mydb.commit()
+    logging.info("End loading to db '{0}'".format(csv_file))
+
+
+def save_to_csv(wiki_filename, csv_filename):
+    with gzip.open(wiki_filename) as archive, open(csv_filename, 'w') as csvfile:
+        logging.info("Starting processing archive data and save to csv file '{0}'".format(wiki_filename))
+        # Extract date from archive name. Date format is YYmmdd-HHMMSS
+        cur_date_str = re.search('pageviews-(.*).gz', wiki_filename).group(1)
+        cur_date = datetime.strptime(cur_date_str, "%Y%m%d-%H%M%S")
+
+        # Filter archive content by wiki projects and save to csv file
+        writer = csv.writer(csvfile,  dialect='mydialect')
+        writer.writerow(['Time', 'Project', 'Page', 'PageView'])
+
+        for line in archive:
+            row = line.split(" ")
+            project = row[0].split(".")
+            if project[0] in WIKI_PROJECTS:
+                # Check that row is correct
+                if '\\' in row or len(row) <= 3:
+                    logging.warning("Incorrect row '{0}'".format(row))
+                    continue
+                writer.writerow([cur_date, row[0], row[1], row[2]])
+        logging.info("Successfully processed archive data and saved to csv file '{0}'".format(csv_filename))
+
+
+def process_file(url):
+    try:
+        logging.info("Start processing url '{0}'".format(url))
+        s = datetime.now()
+        archive_filename = url.split('/')[-1]
+        archive_filepath = WORK_DIR
+        archive_file = os.path.join(archive_filepath, archive_filename)
+        download_file(url, archive_filepath, archive_filename)
+
+        csv_file = os.path.join(CSV_DIR, archive_filename.split('.')[-2] + '.csv')
+
+        if not os.path.isfile(archive_file):
+            logging.info("{0} File {1} not found. Sleep 2 seconds".format(datetime.now(), archive_file))
+            time.sleep(2)
+        save_to_csv(archive_file, csv_file)
+        load_csv_to_db(csv_file)
+        os.remove(archive_file)
+        os.remove(csv_file)
+        e = datetime.now()
+        logging.info("End processing url '{0}'. Duration {1}".format(url, e - s))
+    except:
+        err = sys.exc_info()[0]
+        logging.error("Error: {0}".format(err))
+
+
+def process_all_files(start_date, end_date):
+    try:
+        s = datetime.now()
+        logging.info("Start crawling wiki archive files from {0} to {1}. Max Dop = {2} "
+                     .format(start_date, end_date, MAXDOP))
+
+        links = get_all_links(start_date, end_date)
+        #links = ['https://dumps.wikimedia.org/other/pageviews/2016/2016-10/pageviews-20161024-070000.gz']
+
+        pool = ThreadPool(MAXDOP)
+        results = pool.map(process_file, links)
+        #map(process_file, links)
+        e = datetime.now()
+        logging.info("Successfully crawled wiki archive files from {0} to {1}. Total duration: {2}"
+                     .format(start_date, end_date, e - s))
+    except:
+        e = sys.exc_info()[0]
+        logging.error("Error: {0}".format(e))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('start', action="store", type=valid_date, default="2016-10-24",
+                        help="Date from which will be downloaded. Date format 'YYYY-MM-DD'")
+    parser.add_argument('end', action="store", type=valid_date, default="2016-10-30",
+                        help="Date from which will be downloaded. Date format 'YYYY-MM-DD'")
+
+    args = parser.parse_args()
+    start_date = args.start
+    end_date = args.end
+    #start_date = valid_date("2016-10-24")
+    #end_date = valid_date("2016-10-30")
+    process_all_files(start_date, end_date)
+
+
+if __name__ == "__main__":
+    """
+    This module loads wiki pageview data from wiki dump from 'https://dumps.wikimedia.org/other/pageviews'
+    All processed data will store in MySql database
+    """
+    main()
